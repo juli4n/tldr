@@ -2,51 +2,67 @@ package main
 
 import (
 	"bufio"
+	"bytes"
+	"encoding/gob"
+	"errors"
 	"fmt"
 	"io/ioutil"
-	"log"
 	"net/http"
 	"os"
+	"os/user"
+	"path/filepath"
 	"runtime"
 	"strings"
+	"time"
 
 	"github.com/fatih/color"
+	"github.com/peterbourgon/diskv"
 )
 
 const pageURLPattern = "https://raw.githubusercontent.com/tldr-pages/tldr/master/pages/%s/%s.md"
 
 func main() {
 	if len(os.Args) != 2 {
-		log.Fatal("Usage: tldr <command name>\n")
-	}
-
-	command := os.Args[1]
-	page, err := fetchPage(getPlatform(), command)
-
-	if err != nil {
-		fmt.Println(err)
+		fmt.Fprint(os.Stderr, "What tlrd page do you want?\n")
 		os.Exit(-1)
 	}
 
-	// Command found, render and print to stdout.
-	fmt.Print(renderPage(page))
+	var content string
+	var err error
+
+	page := os.Args[1]
+
+	if content, err = fetchPage(getPlatform(), page); err != nil {
+		fmt.Fprintf(os.Stderr, "Page not found: %s\n", page)
+		os.Exit(-1)
+	}
+
+	// Render and print.
+	fmt.Print(renderPage(content))
 }
 
-func fetchPage(platform, command string) (string, error) {
-	pages := make(chan *string)
+func fetchPage(platform, page string) (string, error) {
+	responses := make(chan *string)
 
-	// Fetch the command from platform and common directories in parallel.
+	// Fetch the page from platform and common directories in parallel.
 	// Then discard the one that fails.
-	go fetch(fmt.Sprintf(pageURLPattern, "common", command), pages)
-	go fetch(fmt.Sprintf(pageURLPattern, platform, command), pages)
+	go fetch(fmt.Sprintf(pageURLPattern, "common", page), responses)
+	go fetch(fmt.Sprintf(pageURLPattern, platform, page), responses)
+
+	cache := newCache()
+	if content, err := cache.read(page); err == nil {
+		return content, nil
+	}
 
 	for i := 0; i < 2; i++ {
-		page := <-pages
-		if page != nil {
-			return *page, nil
+		content := <-responses
+		if content != nil {
+			// Page found, write it to the cache.
+			cache.write(page, *content)
+			return *content, nil
 		}
 	}
-	return "", fmt.Errorf("Command not found: %s", command)
+	return "", fmt.Errorf("Page not found: %s", page)
 }
 
 func fetch(url string, result chan *string) {
@@ -75,9 +91,9 @@ func getPlatform() string {
 
 // Renders simplified page Markdown documentation.
 // See https://github.com/rprieto/tldr/blob/master/CONTRIBUTING.md#markdown-format
-func renderPage(page string) string {
+func renderPage(content string) string {
 	result := ""
-	s := bufio.NewScanner(strings.NewReader(page))
+	s := bufio.NewScanner(strings.NewReader(content))
 
 	for s.Scan() {
 		l := s.Text()
@@ -99,4 +115,66 @@ func renderPage(page string) string {
 		}
 	}
 	return result
+}
+
+type pageCache struct {
+	diskv *diskv.Diskv
+}
+
+// CachedPage is a page stored in the diskv cache.
+type CachedPage struct {
+	// The page content.
+	Page string
+	// Unix time (seconds).
+	CreatedAt int64
+}
+
+func (c *CachedPage) isValid(now int64) bool {
+	return now-c.CreatedAt < 60*60*24 // 1 day.
+}
+
+func newCache() *pageCache {
+	currentUser, err := user.Current()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Could not read home directory: %v\n", err)
+		os.Exit(-1)
+	}
+
+	return &pageCache{
+		diskv: diskv.New(diskv.Options{
+			BasePath: filepath.Join(currentUser.HomeDir, ".tldr", "cache"),
+		})}
+}
+
+func (c *pageCache) write(page string, content string) {
+	var cacheBuffer bytes.Buffer
+	encoder := gob.NewEncoder(&cacheBuffer)
+	encoder.Encode(CachedPage{
+		CreatedAt: time.Now().Unix(),
+		Page:      content,
+	})
+	c.diskv.Write(page, cacheBuffer.Bytes())
+}
+
+func (c *pageCache) read(page string) (string, error) {
+	var cachedData []byte
+	var err error
+	if cachedData, err = c.diskv.Read(page); err != nil {
+		return "", errors.New("Error loading from cache")
+	}
+
+	decoder := gob.NewDecoder(strings.NewReader(string(cachedData)))
+	cp := CachedPage{}
+	if err = decoder.Decode(&cp); err != nil {
+		// Ups, cached data is corrupted.
+		c.diskv.Erase(page)
+		fmt.Fprint(os.Stderr, color.RedString(
+			fmt.Sprintf("Warning: %s is corrupted.\n", c.diskv.BasePath)))
+		return "", errors.New("Not found. Corrupted data.")
+	}
+	if !cp.isValid(time.Now().Unix()) {
+		c.diskv.Erase(page)
+		return "", errors.New("Not found. Expired entry.")
+	}
+	return cp.Page, nil
 }
