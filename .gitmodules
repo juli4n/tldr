@@ -7,3 +7,9 @@
 [submodule "vendor/github.com/mattn/go-colorable"]
 	path = vendor/github.com/mattn/go-colorable
 	url = https://github.com/mattn/go-colorable
+[submodule "vendor/github.com/peterbourgon/diskv"]
+	path = vendor/github.com/peterbourgon/diskv
+	url = https://github.com/peterbourgon/diskv
+[submodule "vendor/github.com/google/btree"]
+	path = vendor/github.com/google/btree
+	url = https://github.com/google/btree
